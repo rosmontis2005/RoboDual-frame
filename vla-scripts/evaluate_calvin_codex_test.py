@@ -27,6 +27,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import resource
 import sys
 import time
 import copy
@@ -68,6 +69,65 @@ CALVIN_ROOT = os.environ['CALVIN_ROOT']
 from collections import Counter
 import json
 import numpy as np
+
+
+def read_proc_io():
+    io_path = Path("/proc/self/io")
+    if not io_path.exists():
+        return {}
+    stats = {}
+    for line in io_path.read_text().splitlines():
+        key, value = line.split(":")
+        stats[key.strip()] = int(value.strip())
+    return stats
+
+
+def runtime_snapshot():
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    snapshot = {
+        "rss_mb": round(rss_kb / 1024, 2),
+        "cuda": torch.cuda.is_available(),
+    }
+    if torch.cuda.is_available():
+        snapshot.update(
+            {
+                "cuda_alloc_mb": round(torch.cuda.memory_allocated() / 1024**2, 2),
+                "cuda_reserved_mb": round(torch.cuda.memory_reserved() / 1024**2, 2),
+                "cuda_max_alloc_mb": round(torch.cuda.max_memory_allocated() / 1024**2, 2),
+                "cuda_max_reserved_mb": round(torch.cuda.max_memory_reserved() / 1024**2, 2),
+            }
+        )
+    snapshot.update(read_proc_io())
+    return snapshot
+
+
+class InitProfiler:
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.start = time.perf_counter()
+        self.last = self.start
+        self.prev_io = read_proc_io()
+
+    def mark(self, stage, extra=None):
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        current_io = read_proc_io()
+        io_delta = {}
+        for key, value in current_io.items():
+            io_delta[f"{key}_delta"] = value - self.prev_io.get(key, 0)
+        payload = {
+            "stage": stage,
+            "stage_s": round(now - self.last, 4),
+            "total_s": round(now - self.start, 4),
+            "runtime": runtime_snapshot(),
+            "io_delta": io_delta,
+        }
+        if extra:
+            payload["extra"] = extra
+        print(f"[init-profile] {json.dumps(payload, sort_keys=True)}", flush=True)
+        self.last = now
+        self.prev_io = current_io
 
 
 def print_and_save(results, sequences, eval_result_path, task_name=None, epoch=None):
@@ -305,15 +365,27 @@ def rollout(env, model, task_oracle, subtask, val_annotations, debug, eval_dir, 
 
 def main(args):
     # Set seed #42
+    profiler = InitProfiler(args.profile_init)
+    profiler.mark("main_start", {"pid": os.getpid()})
     seed_everything(42)
+    profiler.mark("seed_everything_done")
 
     kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=3600))
     acc = Accelerator(kwargs_handlers=[kwargs])
     device = acc.device
+    profiler.mark(
+        "accelerator_initialized",
+        {
+            "device": str(device),
+            "num_processes": acc.num_processes,
+            "process_index": acc.process_index,
+        },
+    )
 
 
     # Load generalist policy
     from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+    profiler.mark("transformers_imported")
     quantization_config = None
     model_dtype = torch.bfloat16
     if args.load_in_4bit:
@@ -337,13 +409,27 @@ def main(args):
         model_kwargs["device_map"] = args.device_map
     if args.attn_implementation != "none":
         model_kwargs["attn_implementation"] = args.attn_implementation
+    profiler.mark(
+        "generalist_config_ready",
+        {
+            "dtype": str(model_dtype),
+            "load_in_4bit": args.load_in_4bit,
+            "load_in_8bit": args.load_in_8bit,
+            "device_map": args.device_map,
+            "low_cpu_mem_usage": args.low_cpu_mem_usage,
+        },
+    )
+    processor = AutoProcessor.from_pretrained(args.generalist_path, trust_remote_code=True)
+    profiler.mark("processor_loaded", {"generalist_path": args.generalist_path})
     model = AutoModelForVision2Seq.from_pretrained(args.generalist_path, **model_kwargs)
     model.eval()
+    profiler.mark("generalist_loaded")
 
     # Load specialist policy
     from prismatic.models.policy.diffusion_policy import DiffusionDiTImagePolicy
     from diffusers.schedulers.scheduling_ddim import DDIMScheduler
     from diffusers.schedulers import DPMSolverMultistepScheduler
+    profiler.mark("specialist_modules_imported")
 
     scheduler = DDIMScheduler( num_train_timesteps = 100, beta_schedule = 'squaredcos_cap_v2', prediction_type="epsilon" )
     shape_meta = {'action' : {'shape': [7]}}
@@ -359,16 +445,23 @@ def main(args):
                                                 cond_drop_chance=0.1 if args.with_cfg else 0.,  
                                                 # set cond_drop_chance > 0 to activate CFG
                                               ).eval().to(device)
+    profiler.mark("specialist_model_initialized", {"fast_num_inference_steps": args.fast_num_inference_steps})
    
 
     from prismatic.vla.action_tokenizer import ActionTokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
+    profiler.mark("action_tokenizer_ready")
 
     from train_spacialist_calvin import DualSystem
     dual_sys = DualSystem(model, diffusion_policy, action_tokenizer)
-    dual_sys.ema_fast_system.load_state_dict(torch.load(args.specialist_path), strict=False)
+    profiler.mark("dual_system_constructed")
+    specialist_state = torch.load(args.specialist_path)
+    profiler.mark("specialist_checkpoint_loaded", {"specialist_path": args.specialist_path})
+    dual_sys.ema_fast_system.load_state_dict(specialist_state, strict=False)
+    profiler.mark("specialist_state_dict_applied")
 
     dual_sys = acc.prepare(dual_sys, device_placement=[True])
+    profiler.mark("accelerate_prepare_done")
 
     save_path = Path('../evaluation_results')
     observation_space = {
@@ -379,9 +472,13 @@ def main(args):
         'language': ['language']}
     eval_dir = save_path / f'eval{torch.cuda.current_device()}'
     os.makedirs(eval_dir, exist_ok=True)
+    profiler.mark("eval_dirs_ready", {"eval_dir": eval_dir.as_posix()})
     env = make_env(os.path.join(CALVIN_ROOT, f"dataset/{args.dataset_subdir}"), observation_space, device, args.use_egl)
+    profiler.mark("environment_created", {"dataset_subdir": args.dataset_subdir, "use_egl": args.use_egl})
     eva = DualSystemCalvinEvaluation(dual_sys, processor, action_tokenizer)
+    profiler.mark("evaluation_wrapper_ready")
     dual_sys.eval()
+    profiler.mark("before_evaluate_policy")
     avg_reward = torch.tensor(
         evaluate_policy(
             eva,
@@ -430,6 +527,7 @@ if __name__ == "__main__":
     parser.add_argument("--fast_num_inference_steps", default=10, type=int)
     parser.add_argument("--max_subtasks", default=None, type=int)
     parser.add_argument("--profile_steps", action="store_true")
+    parser.add_argument("--profile_init", action="store_true")
     args = parser.parse_args()
 
     main(args)

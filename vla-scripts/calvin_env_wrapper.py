@@ -20,9 +20,11 @@ class CalvinEnvWrapperRaw(gym.Wrapper):
             abs_datasets_dir: absolute datset directory
             observation_sapce: {'rgb_obs': ['rgb_static', 'rgb_gripper'], 'depth_obs': [], 'state_obs': ['robot_obs'], 'actions': ['rel_actions'], 'language': ['language']}
         """
-        self.set_egl_device(device)
+        use_egl = kwargs.pop("use_egl", False)
+        if use_egl:
+            self.set_egl_device(device)
         env = get_env(
-            abs_datasets_dir, show_gui=show_gui, obs_space=observation_space, **kwargs
+            abs_datasets_dir, show_gui=show_gui, obs_space=observation_space, use_egl=use_egl, **kwargs
         )
         super(CalvinEnvWrapperRaw, self).__init__(env)
         self.observation_space_keys = observation_space

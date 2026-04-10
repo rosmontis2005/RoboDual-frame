@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+*.egg-info/
+
+evaluation_results/
+CALVIN_ABC-D/
+vla-scripts/CALVIN_ABC-D/
