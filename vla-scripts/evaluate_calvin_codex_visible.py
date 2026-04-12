@@ -6,7 +6,15 @@ keep the simulator window visible.
 """
 
 import argparse
+import os
 from pathlib import Path
+
+DEFAULT_CALVIN_ROOT = Path(__file__).resolve().parents[2] / "calvin"
+DEFAULT_GENERALIST_PATH = Path(__file__).resolve().parents[2] / "models" / "generalist"
+DEFAULT_SPECIALIST_PATH = (
+    Path(__file__).resolve().parents[2] / "models" / "specialist" / "Specialist+Depth+Gripper.pt"
+)
+os.environ.setdefault("CALVIN_ROOT", DEFAULT_CALVIN_ROOT.as_posix())
 
 import evaluate_calvin_codex_test as base
 
@@ -29,8 +37,8 @@ base.make_env = make_env
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--generalist_path", default="openvla7b", type=str)
-    parser.add_argument("--specialist_path", default="specialist_policy.pt", type=str)
+    parser.add_argument("--generalist_path", default=DEFAULT_GENERALIST_PATH.as_posix(), type=str)
+    parser.add_argument("--specialist_path", default=DEFAULT_SPECIALIST_PATH.as_posix(), type=str)
     parser.add_argument("--calvin_path", default="./calvin", type=str)
     parser.add_argument("--log_dir", default="CALVIN_ABC-D", type=str)
     parser.add_argument("--with_depth", default=True, action="store_true")
@@ -52,6 +60,14 @@ if __name__ == "__main__":
     parser.add_argument("--max_subtasks", default=None, type=int)
     parser.add_argument("--profile_steps", action="store_true")
     parser.add_argument("--profile_init", action="store_true")
+    parser.set_defaults(
+        dataset_subdir="calvin_debug_dataset",
+        num_sequences=5,
+        ep_len=120,
+        max_subtasks=1,
+        load_in_4bit=True,
+        low_cpu_mem_usage=True,
+    )
     args = parser.parse_args()
 
     base.main(args)
