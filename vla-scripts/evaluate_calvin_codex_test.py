@@ -64,6 +64,8 @@ logger = logging.getLogger(__name__)
 
 os.environ["FFMPEG_BINARY"] = "auto-detect"
 CALVIN_ROOT = os.environ['CALVIN_ROOT']
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BENCHMARK_NUM_SEQUENCES = 100
 
 
 from collections import Counter
@@ -99,6 +101,15 @@ def runtime_snapshot():
         )
     snapshot.update(read_proc_io())
     return snapshot
+
+
+def emit_profile_record(profile_output, record):
+    line = json.dumps(record, sort_keys=True)
+    print(f"[specialist-profile] {line}", flush=True)
+    if profile_output is None:
+        return
+    with open(profile_output, "a") as file:
+        file.write(line + "\n")
 
 
 class InitProfiler:
@@ -161,9 +172,9 @@ def print_and_save(results, sequences, eval_result_path, task_name=None, epoch=N
     current_data[epoch] = data
 
     # model_name = 'vla-test'
-    if not os.path.isdir(f'./{task_name}'):
-        os.mkdir( f'./{task_name}')
-    with open(f'./{task_name}/split_{torch.cuda.current_device()}.json', "w") as file:
+    split_dir = Path(eval_result_path).parent / str(task_name)
+    split_dir.mkdir(parents=True, exist_ok=True)
+    with open(split_dir / f'split_{torch.cuda.current_device()}.json', "w") as file:
         json.dump(chain_sr, file)
 
     print()
@@ -200,6 +211,8 @@ def evaluate_policy(
     debug=False,
     max_subtasks=None,
     profile_steps=False,
+    profile_output=None,
+    profile_rank=0,
 ):
     conf_dir = Path(f"{CALVIN_ROOT}/calvin_models") / "conf"
     task_cfg = OmegaConf.load(conf_dir / "callbacks/rollout/tasks/new_playtable_tasks.yaml")
@@ -212,16 +225,24 @@ def evaluate_policy(
         val_annotations = OmegaConf.load(conf_dir / "annotations/new_playtable_validation.yaml")
         
     eval_dir = get_log_dir(eval_dir)
-    eval_sequences = get_sequences(num_sequences)
-    num_seq_per_procs = num_sequences // num_procs
-    eval_sequences = eval_sequences[num_seq_per_procs*procs_id:num_seq_per_procs*(procs_id+1)]
+    eval_sequences = list(get_sequences(num_sequences))
+    num_seq_per_procs = int(np.ceil(num_sequences / num_procs))
+    start_idx = num_seq_per_procs * procs_id
+    end_idx = min(num_sequences, num_seq_per_procs * (procs_id + 1))
+    eval_sequences = eval_sequences[start_idx:end_idx]
     eval_sequences_for_report = list(eval_sequences)
+    if profile_steps:
+        print(
+            f"[profile] rank={profile_rank} sequence_range=[{start_idx}, {end_idx}) "
+            f"profile_output={profile_output}",
+            flush=True,
+        )
 
     results = []
     if not debug:
         eval_sequences = tqdm(eval_sequences, position=0, leave=True)
 
-    sequence_i = 0
+    sequence_i = start_idx
     for initial_state, eval_sequence in eval_sequences:
         result = evaluate_sequence(
             env,
@@ -236,6 +257,8 @@ def evaluate_policy(
             ep_len,
             max_subtasks=max_subtasks,
             profile_steps=profile_steps,
+            profile_output=profile_output,
+            profile_rank=profile_rank,
         )
         results.append(result)
         if not debug:
@@ -269,6 +292,8 @@ def evaluate_sequence(
     ep_len,
     max_subtasks=None,
     profile_steps=False,
+    profile_output=None,
+    profile_rank=0,
 ):
     robot_obs, scene_obs = get_env_state_for_initial_condition(initial_state)
     env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
@@ -294,6 +319,8 @@ def evaluate_sequence(
             sequence_i,
             ep_len,
             profile_steps=profile_steps,
+            profile_output=profile_output,
+            profile_rank=profile_rank,
         )
         if success:
             # print('success: ', subtask_i)
@@ -303,7 +330,21 @@ def evaluate_sequence(
     return success_counter
 
 
-def rollout(env, model, task_oracle, subtask, val_annotations, debug, eval_dir, subtask_i, sequence_i, ep_len, profile_steps=False):
+def rollout(
+    env,
+    model,
+    task_oracle,
+    subtask,
+    val_annotations,
+    debug,
+    eval_dir,
+    subtask_i,
+    sequence_i,
+    ep_len,
+    profile_steps=False,
+    profile_output=None,
+    profile_rank=0,
+):
     if debug:
         print(f"{subtask} ", end="")
         time.sleep(0.5)
@@ -313,7 +354,8 @@ def rollout(env, model, task_oracle, subtask, val_annotations, debug, eval_dir, 
     start_info = env.get_info()
     if profile_steps:
         print(
-            f"[profile] sequence={sequence_i} subtask={subtask_i} name={subtask} ep_len={ep_len}",
+            f"[profile] rank={profile_rank} sequence={sequence_i} subtask={subtask_i} "
+            f"name={subtask} ep_len={ep_len}",
             flush=True,
         )
     if debug:
@@ -340,14 +382,38 @@ def rollout(env, model, task_oracle, subtask, val_annotations, debug, eval_dir, 
         oracle_step_s = time.perf_counter() - oracle_start
         if profile_steps:
             step_profile = getattr(model, "last_step_profile", {})
-            print(
-                "[profile] "
-                f"sequence={sequence_i} subtask={subtask_i} step={step} "
-                f"model_s={model_step_s:.4f} env_s={env_step_s:.4f} oracle_s={oracle_step_s:.4f} "
-                f"details={json.dumps(step_profile, sort_keys=True)}",
-                flush=True,
+            emit_profile_record(
+                profile_output,
+                {
+                    "event": "step",
+                    "rank": int(profile_rank),
+                    "sequence": int(sequence_i),
+                    "subtask_i": int(subtask_i),
+                    "task": subtask,
+                    "step": int(step),
+                    "ep_len": int(ep_len),
+                    "model_s": round(float(model_step_s), 6),
+                    "env_s": round(float(env_step_s), 6),
+                    "oracle_s": round(float(oracle_step_s), 6),
+                    "step_success": bool(len(current_task_info) > 0),
+                    "terminal_step": bool(len(current_task_info) > 0),
+                    "profile": step_profile,
+                },
             )
         if len(current_task_info) > 0:
+            if profile_steps:
+                emit_profile_record(
+                    profile_output,
+                    {
+                        "event": "subtask_end",
+                        "rank": int(profile_rank),
+                        "sequence": int(sequence_i),
+                        "subtask_i": int(subtask_i),
+                        "task": subtask,
+                        "task_success": True,
+                        "steps": int(step + 1),
+                    },
+                )
             if debug:
                 print(colored("success", "green"), end=" ")
                 for key in img_dict.keys():
@@ -355,6 +421,19 @@ def rollout(env, model, task_oracle, subtask, val_annotations, debug, eval_dir, 
                     clip.write_gif(os.path.join(eval_dir, f'{sequence_i}-{subtask_i}-{subtask}-{key}-succ.gif'), fps=30)
             return True
 
+    if profile_steps:
+        emit_profile_record(
+            profile_output,
+            {
+                "event": "subtask_end",
+                "rank": int(profile_rank),
+                "sequence": int(sequence_i),
+                "subtask_i": int(subtask_i),
+                "task": subtask,
+                "task_success": False,
+                "steps": int(ep_len),
+            },
+        )
     if debug:
         print(colored("fail", "red"), end=" ")
         for key in img_dict.keys():
@@ -364,13 +443,14 @@ def rollout(env, model, task_oracle, subtask, val_annotations, debug, eval_dir, 
 
 
 def main(args):
+    args.num_sequences = BENCHMARK_NUM_SEQUENCES
     # Set seed #42
     profiler = InitProfiler(args.profile_init)
     profiler.mark("main_start", {"pid": os.getpid()})
     seed_everything(42)
     profiler.mark("seed_everything_done")
 
-    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=3600))
+    kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=12))
     acc = Accelerator(kwargs_handlers=[kwargs])
     device = acc.device
     profiler.mark(
@@ -463,7 +543,7 @@ def main(args):
     dual_sys = acc.prepare(dual_sys, device_placement=[True])
     profiler.mark("accelerate_prepare_done")
 
-    save_path = Path('../evaluation_results')
+    save_path = REPO_ROOT / 'evaluation_results'
     observation_space = {
         'rgb_obs': ['rgb_static', 'rgb_gripper', ],  # rgb_tactile
         'depth_obs': ['depth_static', 'depth_gripper'], 
@@ -475,7 +555,24 @@ def main(args):
     profiler.mark("eval_dirs_ready", {"eval_dir": eval_dir.as_posix()})
     env = make_env(os.path.join(CALVIN_ROOT, f"dataset/{args.dataset_subdir}"), observation_space, device, args.use_egl)
     profiler.mark("environment_created", {"dataset_subdir": args.dataset_subdir, "use_egl": args.use_egl})
-    eva = DualSystemCalvinEvaluation(dual_sys, processor, action_tokenizer)
+    profile_output = None
+    if args.profile_steps:
+        profile_output = save_path / f"specialist_profile_rank{acc.process_index}.jsonl"
+        with open(profile_output, "w") as file:
+            file.write("")
+        profiler.mark("profile_output_ready", {"profile_output": profile_output.as_posix()})
+    eval_sr_path = save_path / f"success_rate_rank{acc.process_index}.txt"
+    eval_result_path = save_path / f"result_rank{acc.process_index}.json"
+    with open(eval_sr_path, "w") as file:
+        file.write("")
+    eva = DualSystemCalvinEvaluation(
+        dual_sys,
+        processor,
+        action_tokenizer,
+        profile_steps=args.profile_steps,
+        profile_sample_var_k=args.profile_sample_var_k,
+        profile_sample_var_interval=args.profile_sample_var_interval,
+    )
     profiler.mark("evaluation_wrapper_ready")
     dual_sys.eval()
     profiler.mark("before_evaluate_policy")
@@ -483,8 +580,8 @@ def main(args):
         evaluate_policy(
             eva,
             env,
-            save_path / 'success_rate.txt',
-            save_path / 'result.txt',
+            eval_sr_path,
+            eval_result_path,
             acc.num_processes,
             acc.process_index,
             eval_dir=eval_dir,
@@ -495,6 +592,8 @@ def main(args):
             debug=args.debug,
             max_subtasks=args.max_subtasks,
             profile_steps=args.profile_steps,
+            profile_output=profile_output,
+            profile_rank=acc.process_index,
         )
     ).float().mean().to(device)
 
@@ -515,7 +614,7 @@ if __name__ == "__main__":
     parser.add_argument("--with_cfg", default=False, action="store_true")
     parser.add_argument("--enrich_lang", default=False, action="store_true")
     parser.add_argument("--dataset_subdir", default="task_ABC_D", type=str)
-    parser.add_argument("--num_sequences", default=1000, type=int)
+    parser.add_argument("--num_sequences", default=BENCHMARK_NUM_SEQUENCES, type=int)
     parser.add_argument("--ep_len", default=360, type=int)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--use_egl", action="store_true")
@@ -526,7 +625,10 @@ if __name__ == "__main__":
     parser.add_argument("--attn_implementation", default="none", type=str)
     parser.add_argument("--fast_num_inference_steps", default=10, type=int)
     parser.add_argument("--max_subtasks", default=None, type=int)
-    parser.add_argument("--profile_steps", action="store_true")
+    parser.add_argument("--profile_steps", dest="profile_steps", default=True, action="store_true")
+    parser.add_argument("--no_profile_steps", dest="profile_steps", action="store_false")
+    parser.add_argument("--profile_sample_var_k", default=3, type=int)
+    parser.add_argument("--profile_sample_var_interval", default=8, type=int)
     parser.add_argument("--profile_init", action="store_true")
     args = parser.parse_args()
 
