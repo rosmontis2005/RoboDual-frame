@@ -55,7 +55,7 @@ from termcolor import colored
 import torch
 from tqdm.auto import tqdm
 
-from dual_sys_evaluation_0424test import DualSystemCalvinEvaluation
+from dual_sys_evaluation_0424test import DualSystemCalvinEvaluation as BaseDualSystemCalvinEvaluation
 
 from ema_pytorch import EMA
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -143,6 +143,194 @@ class InitProfiler:
         print(f"[init-profile] {json.dumps(payload, sort_keys=True)}", flush=True)
         self.last = now
         self.prev_io = current_io
+
+
+class VariableSlowCallDualSystemEvaluation(BaseDualSystemCalvinEvaluation):
+    """Evaluation wrapper with age-based and risk-triggered slow call policies.
+
+    Risk-triggered policies use the previous step's profile to decide whether the
+    current step should refresh the slow system. This avoids running the fast
+    policy twice in one step while still reacting to empty-ref instability.
+    """
+
+    def __init__(
+        self,
+        *args,
+        slow_call_strategy="risk_balanced",
+        risk_start_age=8,
+        min_slow_age=7,
+        risk_score_threshold=2,
+        risk_late_age=12,
+        risk_late_score_threshold=1,
+        aggregation_delta_ee6_threshold=0.22,
+        aggregation_delta_ee6_medium_threshold=0.12,
+        jerk_l2_ee6_threshold=0.32,
+        gripper_flip_count_threshold=2,
+        sample_var_ee6_threshold=0.012,
+        sample_var_gripper_threshold=0.86,
+        **kwargs,
+    ):
+        base_policy = kwargs.pop("slow_trigger_policy", "age_empty")
+        if slow_call_strategy == "fixed_mod8":
+            base_policy = "fixed_mod8"
+        else:
+            base_policy = "age_empty"
+        super().__init__(*args, slow_trigger_policy=base_policy, **kwargs)
+        self.slow_call_strategy = str(slow_call_strategy)
+        self.risk_start_age = int(risk_start_age)
+        self.min_slow_age = int(min_slow_age)
+        self.risk_score_threshold = int(risk_score_threshold)
+        self.risk_late_age = int(risk_late_age)
+        self.risk_late_score_threshold = int(risk_late_score_threshold)
+        self.aggregation_delta_ee6_threshold = float(aggregation_delta_ee6_threshold)
+        self.aggregation_delta_ee6_medium_threshold = float(aggregation_delta_ee6_medium_threshold)
+        self.jerk_l2_ee6_threshold = float(jerk_l2_ee6_threshold)
+        self.gripper_flip_count_threshold = int(gripper_flip_count_threshold)
+        self.sample_var_ee6_threshold = float(sample_var_ee6_threshold)
+        self.sample_var_gripper_threshold = float(sample_var_gripper_threshold)
+        self._slow_decision_details = {}
+
+    @staticmethod
+    def _as_float(value):
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if np.isnan(value) or np.isinf(value):
+            return None
+        return value
+
+    def _risk_from_previous_step(self):
+        profile = self.last_step_profile or {}
+        prev_age = profile.get("slow_age_after", profile.get("step_since_slow"))
+        if prev_age is None:
+            return {
+                "source_age": None,
+                "score": 0,
+                "flags": {},
+                "trigger": False,
+                "reason": "no_previous_profile",
+            }
+        prev_age = int(prev_age)
+        if prev_age < self.risk_start_age:
+            return {
+                "source_age": prev_age,
+                "score": 0,
+                "flags": {},
+                "trigger": False,
+                "reason": "before_risk_age",
+            }
+
+        agg = self._as_float(profile.get("aggregation_delta_ee6"))
+        jerk = self._as_float(profile.get("jerk_l2_ee6"))
+        sample_ee6 = self._as_float(profile.get("sample_var_ee6"))
+        sample_gripper = self._as_float(profile.get("sample_var_gripper"))
+        flip = self._as_float(profile.get("gripper_flip_count"))
+
+        flags = {
+            "aggregation_delta_ee6_high": agg is not None and agg > self.aggregation_delta_ee6_threshold,
+            "jerk_l2_ee6_high": jerk is not None and jerk > self.jerk_l2_ee6_threshold,
+            "gripper_flip_count_high": flip is not None and flip >= self.gripper_flip_count_threshold,
+            "sample_var_ee6_high": sample_ee6 is not None and sample_ee6 > self.sample_var_ee6_threshold,
+            "sample_var_gripper_high": sample_gripper is not None and sample_gripper > self.sample_var_gripper_threshold,
+            "aggregation_delta_ee6_medium": agg is not None and agg > self.aggregation_delta_ee6_medium_threshold,
+        }
+        score_flags = [
+            flags["aggregation_delta_ee6_high"],
+            flags["jerk_l2_ee6_high"],
+            flags["gripper_flip_count_high"],
+            flags["sample_var_ee6_high"],
+            flags["sample_var_gripper_high"],
+        ]
+        score = int(sum(1 for flag in score_flags if flag))
+
+        direct_balanced = (
+            flags["aggregation_delta_ee6_high"]
+            or flags["jerk_l2_ee6_high"]
+            or flags["gripper_flip_count_high"]
+            or flags["sample_var_ee6_high"]
+            or (flags["sample_var_gripper_high"] and flags["aggregation_delta_ee6_medium"])
+        )
+        risk_score_trigger = score >= self.risk_score_threshold
+        late_score_trigger = prev_age >= self.risk_late_age and score >= self.risk_late_score_threshold
+
+        if self.slow_call_strategy == "risk_balanced":
+            trigger = direct_balanced
+            reason = "risk_balanced" if trigger else "risk_clear"
+        elif self.slow_call_strategy == "risk_score":
+            trigger = risk_score_trigger
+            reason = "risk_score" if trigger else "risk_clear"
+        elif self.slow_call_strategy == "risk_conservative":
+            trigger = score >= 1
+            reason = "risk_conservative" if trigger else "risk_clear"
+        elif self.slow_call_strategy == "risk_aggressive":
+            trigger = risk_score_trigger or late_score_trigger
+            reason = "risk_aggressive" if trigger else "risk_clear"
+        else:
+            trigger = False
+            reason = "strategy_without_risk"
+
+        return {
+            "source_age": prev_age,
+            "score": score,
+            "flags": flags,
+            "trigger": bool(trigger),
+            "reason": reason,
+            "values": {
+                "aggregation_delta_ee6": agg,
+                "jerk_l2_ee6": jerk,
+                "gripper_flip_count": flip,
+                "sample_var_ee6": sample_ee6,
+                "sample_var_gripper": sample_gripper,
+            },
+        }
+
+    def _should_call_slow_system(self, step):
+        self._slow_decision_details = {
+            "slow_call_strategy": self.slow_call_strategy,
+            "risk_start_age": self.risk_start_age,
+            "min_slow_age": self.min_slow_age,
+            "risk_score_threshold": self.risk_score_threshold,
+            "risk_late_age": self.risk_late_age,
+            "risk_late_score_threshold": self.risk_late_score_threshold,
+        }
+
+        if self.last_slow_step is None:
+            self._slow_decision_details["slow_risk"] = None
+            return True, "initial"
+
+        if self.slow_call_strategy == "fixed_mod8":
+            if (step + 1) % self.temporal_size == 0:
+                self._slow_decision_details["slow_risk"] = None
+                return True, "fixed_mod8"
+            self._slow_decision_details["slow_risk"] = None
+            return False, "fixed_mod8_skip"
+
+        slow_age_before = int(step - self.last_slow_step)
+        self._slow_decision_details["slow_age_before_decision"] = slow_age_before
+        if slow_age_before < self.min_slow_age:
+            self._slow_decision_details["slow_risk"] = None
+            return False, "min_slow_age_skip"
+        if slow_age_before >= self.max_slow_age:
+            self._slow_decision_details["slow_risk"] = None
+            return True, "max_slow_age"
+        if self.slow_call_strategy == "age_empty":
+            self._slow_decision_details["slow_risk"] = None
+            return False, "age_skip"
+
+        risk = self._risk_from_previous_step()
+        self._slow_decision_details["slow_risk"] = risk
+        if slow_age_before >= self.risk_start_age and risk["trigger"]:
+            return True, risk["reason"]
+        return False, "risk_skip"
+
+    def step(self, obs, instruction, step):
+        action = super().step(obs, instruction, step)
+        if self.last_step_profile is not None:
+            self.last_step_profile.update(self._slow_decision_details)
+        return action
 
 
 def print_and_save(results, sequences, eval_result_path, task_name=None, epoch=None):
@@ -568,7 +756,7 @@ def main(args):
     eval_result_path = save_path / f"result_rank{acc.process_index}.json"
     with open(eval_sr_path, "w") as file:
         file.write("")
-    eva = DualSystemCalvinEvaluation(
+    eva = VariableSlowCallDualSystemEvaluation(
         dual_sys,
         processor,
         action_tokenizer,
@@ -579,6 +767,18 @@ def main(args):
         slow_trigger_policy=args.slow_trigger_policy,
         max_slow_age=args.max_slow_age,
         empty_ref_after_age=args.empty_ref_after_age,
+        slow_call_strategy=args.slow_call_strategy,
+        risk_start_age=args.risk_start_age,
+        min_slow_age=args.min_slow_age,
+        risk_score_threshold=args.risk_score_threshold,
+        risk_late_age=args.risk_late_age,
+        risk_late_score_threshold=args.risk_late_score_threshold,
+        aggregation_delta_ee6_threshold=args.aggregation_delta_ee6_threshold,
+        aggregation_delta_ee6_medium_threshold=args.aggregation_delta_ee6_medium_threshold,
+        jerk_l2_ee6_threshold=args.jerk_l2_ee6_threshold,
+        gripper_flip_count_threshold=args.gripper_flip_count_threshold,
+        sample_var_ee6_threshold=args.sample_var_ee6_threshold,
+        sample_var_gripper_threshold=args.sample_var_gripper_threshold,
     )
     if args.profile_steps:
         emit_profile_record(
@@ -586,14 +786,27 @@ def main(args):
             {
                 "event": "run_config",
                 "rank": int(acc.process_index),
-                "entrypoint": "evaluate_calvin_codex_test_0424test.py",
+                "entrypoint": "evaluate_calvin_0428.py",
                 "dataset_subdir": args.dataset_subdir,
                 "num_sequences": int(args.num_sequences),
                 "ep_len": int(args.ep_len),
                 "max_subtasks": None if args.max_subtasks is None else int(args.max_subtasks),
-                "slow_trigger_policy": args.slow_trigger_policy,
+                "slow_call_strategy": args.slow_call_strategy,
+                "slow_trigger_policy_arg": args.slow_trigger_policy,
+                "effective_slow_trigger_policy": eva.slow_trigger_policy,
                 "max_slow_age": int(args.max_slow_age),
                 "empty_ref_after_age": int(args.empty_ref_after_age),
+                "min_slow_age": int(args.min_slow_age),
+                "risk_start_age": int(args.risk_start_age),
+                "risk_score_threshold": int(args.risk_score_threshold),
+                "risk_late_age": int(args.risk_late_age),
+                "risk_late_score_threshold": int(args.risk_late_score_threshold),
+                "aggregation_delta_ee6_threshold": float(args.aggregation_delta_ee6_threshold),
+                "aggregation_delta_ee6_medium_threshold": float(args.aggregation_delta_ee6_medium_threshold),
+                "jerk_l2_ee6_threshold": float(args.jerk_l2_ee6_threshold),
+                "gripper_flip_count_threshold": int(args.gripper_flip_count_threshold),
+                "sample_var_ee6_threshold": float(args.sample_var_ee6_threshold),
+                "sample_var_gripper_threshold": float(args.sample_var_gripper_threshold),
                 "profile_sample_var_k": int(args.profile_sample_var_k),
                 "profile_sample_var_interval": int(args.profile_sample_var_interval),
                 "profile_sample_var_ages": args.profile_sample_var_ages,
@@ -657,6 +870,12 @@ if __name__ == "__main__":
     parser.add_argument("--profile_sample_var_interval", default=8, type=int)
     parser.add_argument("--profile_sample_var_ages", default="", type=str)
     parser.add_argument(
+        "--slow_call_strategy",
+        default="risk_balanced",
+        choices=["fixed_mod8", "age_empty", "risk_balanced", "risk_score", "risk_conservative", "risk_aggressive"],
+        type=str,
+    )
+    parser.add_argument(
         "--slow_trigger_policy",
         default="age_empty",
         choices=["fixed_mod8", "age_empty"],
@@ -664,6 +883,17 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max_slow_age", default=12, type=int)
     parser.add_argument("--empty_ref_after_age", default=8, type=int)
+    parser.add_argument("--min_slow_age", default=7, type=int)
+    parser.add_argument("--risk_start_age", default=8, type=int)
+    parser.add_argument("--risk_score_threshold", default=2, type=int)
+    parser.add_argument("--risk_late_age", default=12, type=int)
+    parser.add_argument("--risk_late_score_threshold", default=1, type=int)
+    parser.add_argument("--aggregation_delta_ee6_threshold", default=0.22, type=float)
+    parser.add_argument("--aggregation_delta_ee6_medium_threshold", default=0.12, type=float)
+    parser.add_argument("--jerk_l2_ee6_threshold", default=0.32, type=float)
+    parser.add_argument("--gripper_flip_count_threshold", default=2, type=int)
+    parser.add_argument("--sample_var_ee6_threshold", default=0.012, type=float)
+    parser.add_argument("--sample_var_gripper_threshold", default=0.86, type=float)
     parser.add_argument("--profile_init", action="store_true")
     args = parser.parse_args()
 
