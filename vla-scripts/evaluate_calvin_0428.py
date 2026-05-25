@@ -36,6 +36,18 @@ from accelerate import Accelerator
 from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CALVIN_ROOT = REPO_ROOT.parent / "calvin"
+CALVIN_ROOT_PATH = Path(os.environ.get("CALVIN_ROOT", DEFAULT_CALVIN_ROOT)).expanduser().resolve()
+os.environ.setdefault("CALVIN_ROOT", CALVIN_ROOT_PATH.as_posix())
+for dependency_path in (
+    CALVIN_ROOT_PATH / "calvin_models",
+    CALVIN_ROOT_PATH / "calvin_env",
+    CALVIN_ROOT_PATH / "calvin_env" / "tacto",
+):
+    if dependency_path.exists():
+        sys.path.insert(0, dependency_path.as_posix())
+
 # This is for using the locally installed repo clone when using slurm
 from calvin_agent.models.calvin_base_model import CalvinBaseModel
 
@@ -63,11 +75,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 logger = logging.getLogger(__name__)
 
 os.environ["FFMPEG_BINARY"] = "auto-detect"
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CALVIN_ROOT = REPO_ROOT.parent / "calvin"
 DEFAULT_GENERALIST_PATH = REPO_ROOT.parent / "models" / "generalist"
 DEFAULT_SPECIALIST_PATH = REPO_ROOT.parent / "models" / "specialist" / "Specialist+Depth+Gripper.pt"
-os.environ.setdefault("CALVIN_ROOT", DEFAULT_CALVIN_ROOT.as_posix())
 CALVIN_ROOT = os.environ["CALVIN_ROOT"]
 BENCHMARK_NUM_SEQUENCES = 100
 
